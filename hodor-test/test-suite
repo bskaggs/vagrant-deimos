@@ -1,0 +1,99 @@
+#!/bin/bash
+set -o errexit -o nounset -o pipefail
+function -h {
+cat <<USAGE
+ USAGE: test-suite <Mesos master URL>
+
+USAGE
+}; function --help { -h ;}                 # A nice way to handle -h and --help
+export LC_ALL=en_US.UTF-8                    # A locale that works consistently
+
+function main {
+  [[ ! ${PTYHONPATH+isset} ]] || preamble >&2
+  hodor "$@"
+}
+
+function globals {
+  this="$(dirname "$0")"
+}; globals
+
+function preamble {
+cat <<\EOF
+You may need to set some environment variables to point to your Mesos build:
+
+  # The distribute and proto eggs aren't strictly necessary.
+  PYTHONPATH=/path/to/mesos/build/src/python/dist/mesos-*.egg
+
+You probably won't need to set MESOS_NATIVE_LIBRARY.
+EOF
+}
+
+function hodor {
+  harness 60 hodor_tests "$@"
+}
+
+function harness {
+  local timeout="$1" ; shift
+  ( cd "$this" && "$@" ) &
+  local worker_process=$!
+  trap "killtree $worker_process" TERM INT
+  local token=/tmp/"$(printf hodor-test-suite.%04x.%04x $RANDOM $RANDOM)"
+  ( trap 'exit 0' TERM
+    sleep "$timeout"
+    touch "$token"
+    killtree "$worker_process" ) &>/dev/null &
+  local term_process=$!
+  trap "killtree $worker_process $term_process || true ; rm -f $token" TERM INT
+  if wait "$worker_process"
+  then
+    msg "**** SUCCESS"
+  else
+    local code=$?
+    [[ -e "$token" ]] && msg "**** TIMEOUT (${timeout}s)" || msg "**** FAILURE"
+  fi
+  killtree "$term_process" || true
+  rm -f "$token"
+  return "${code:-0}"
+}
+
+function test_ {
+   local master="$1" test="$2" ; shift 2
+  ./hodor-test.py --master "$master" --test "$test" "$@"
+}
+
+function test_hodor {
+  test_ "$1" hodor       --test.trials "${2:-2}"
+}
+
+function hodor_tests {
+  test_hodor   "$1"
+}
+
+function killtree {
+  if [[ $# -gt 1 ]]
+  then
+    for arg in "$@"
+    do killtree "$arg" || true
+    done
+    return 0
+  fi
+  kill -STOP "$1" &>/dev/null
+  ps -e -o pid= -o ppid= | while read -r pid ppid
+                           do
+                             [[ $ppid = $1 ]] || continue
+                             killtree "$pid"  || true
+                           done
+  kill -CONT "$1" &>/dev/null
+  kill -TERM "$1" &>/dev/null
+}
+
+function msg { out "$*" >&2 ;}
+function err { local x=$? ; msg "$*" ; return $(( $x == 0 ? 1 : $x )) ;}
+function out { printf '%s\n' "$*" ;}
+
+######################### Delegates to subcommands or runs main, as appropriate
+if [[ ${1:-} ]] && declare -F | cut -d' ' -f3 | fgrep -qx -- "${1:-}"
+then "$@"
+else main "$@"
+fi
+
